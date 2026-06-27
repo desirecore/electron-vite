@@ -41,8 +41,10 @@
 
 ### Install
 
+> This is a community fork published as [`@desirecore/electron-vite`](https://www.npmjs.com/package/@desirecore/electron-vite). The CLI command stays `electron-vite`.
+
 ```sh
-npm i electron-vite -D
+npm i @desirecore/electron-vite -D
 ```
 
 ### Development & Build
