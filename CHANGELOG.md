@@ -1,3 +1,7 @@
+### v6.0.0-beta.3 (_2026-06-27_)
+
+- feat: add Electron 43 build targets (Node 24.17 / Chromium 150); verified end-to-end on Electron 43 (V8 15.0), including `build.bytecode`
+
 ### v6.0.0-beta.2 (_2026-06-27_)
 
 > Fork release published as `@desirecore/electron-vite` (CLI command stays `electron-vite`). Stabilizes the Vite 8 / Rolldown beta and merges a batch of long-pending upstream fixes. Issue links reference the upstream `alex8088/electron-vite` tracker.

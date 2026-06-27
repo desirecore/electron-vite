@@ -97,6 +97,7 @@ export function getElectronNodeTarget(): string {
   const electronVer = getElectronMajorVer()
 
   const nodeVer = {
+    '43': '24.17',
     '42': '24.15',
     '41': '24.14',
     '40': '24.14',
@@ -121,6 +122,9 @@ export function getElectronNodeTarget(): string {
   }
   if (electronVer && parseInt(electronVer) > 10) {
     let target = nodeVer[electronVer]
+    // Unknown (typically newer-than-table) versions fall back to the newest known
+    // target. Integer-like keys are iterated in ascending numeric order, so the
+    // newest entry is last — reverse() puts it first.
     if (!target) target = Object.values(nodeVer).reverse()[0]
     return 'node' + target
   }
@@ -131,6 +135,7 @@ export function getElectronChromeTarget(): string {
   const electronVer = getElectronMajorVer()
 
   const chromeVer = {
+    '43': '150',
     '42': '148',
     '41': '146',
     '40': '144',
@@ -155,6 +160,9 @@ export function getElectronChromeTarget(): string {
   }
   if (electronVer && parseInt(electronVer) > 10) {
     let target = chromeVer[electronVer]
+    // Unknown (typically newer-than-table) versions fall back to the newest known
+    // target. Integer-like keys are iterated in ascending numeric order, so the
+    // newest entry is last — reverse() puts it first.
     if (!target) target = Object.values(chromeVer).reverse()[0]
     return 'chrome' + target
   }
