@@ -23,7 +23,7 @@ export default function modulePathPlugin(factory: ConfigFactory<MainViteConfig>)
       if (id.endsWith('?modulePath')) {
         // id resolved by Vite resolve plugin
         const config = await factory.build(true)
-        const bundles = await bundleEntryFile(cleanUrl(id), config)
+        const bundles = await bundleEntryFile(cleanUrl(id), config, factory)
         const [outputChunk, ...outputChunks] = bundles.output
         const hash = this.emitFile({
           type: 'asset',
@@ -91,13 +91,22 @@ export default function modulePathPlugin(factory: ConfigFactory<MainViteConfig>)
   }
 }
 
-async function bundleEntryFile(input: string, config: InlineConfig): Promise<Rolldown.RolldownOutput> {
+async function bundleEntryFile(
+  input: string,
+  config: InlineConfig,
+  factory: ConfigFactory<MainViteConfig>
+): Promise<Rolldown.RolldownOutput> {
   const viteConfig = mergeConfig(config, {
     build: {
       write: false,
       watch: false
     },
     plugins: [
+      // Recursively resolve nested `?modulePath` imports within the sub-build.
+      // The clean sub-build config strips electron-vite's builtin plugins, so
+      // re-add this plugin to keep nested modules as standalone bundles instead
+      // of inlining them into the parent (and to preserve their exports).
+      modulePathPlugin(factory),
       {
         name: 'vite:entry-file-name',
         outputOptions(output): Rolldown.OutputOptions {

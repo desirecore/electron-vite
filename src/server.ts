@@ -14,7 +14,7 @@ import { startElectron } from './electron'
 
 export async function createServer(
   inlineConfig: InlineConfig = {},
-  options: { rendererOnly?: boolean }
+  options: { rendererOnly?: boolean; noElectronStart?: boolean }
 ): Promise<void> {
   process.env.NODE_ENV_ELECTRON_VITE = 'development'
   const config = await resolveConfig(inlineConfig, 'serve', 'development')
@@ -35,7 +35,7 @@ export async function createServer(
 
         if (ps) {
           ps.removeAllListeners()
-          ps.kill()
+          stopElectron(ps)
           ps = startElectron(inlineConfig.root)
 
           logger.info(colors.green(`\nrestarting electron app...\n`))
@@ -100,10 +100,27 @@ export async function createServer(
       server.printUrls()
     }
 
-    ps = startElectron(inlineConfig.root)
+    if (options.noElectronStart) {
+      logger.info(colors.green(`\ndev server is ready, start the electron app manually to connect to it\n`))
+    } else {
+      ps = startElectron(inlineConfig.root)
 
-    logger.info(colors.green(`\nstarting electron app...\n`))
+      logger.info(colors.green(`\nstarting electron app...\n`))
+    }
   }
+}
+
+// Stop a running Electron child during hot reload. SIGTERM lets the app quit
+// gracefully, but an app that intercepts it (e.g. a before-quit handler) could
+// hang, so fall back to SIGKILL if it has not exited in time.
+function stopElectron(ps: ChildProcess): void {
+  ps.kill()
+  const timer = setTimeout(() => {
+    if (ps.exitCode === null && ps.signalCode === null) {
+      ps.kill('SIGKILL')
+    }
+  }, 5000)
+  ps.once('exit', () => clearTimeout(timer))
 }
 
 type UserConfig = ViteConfig & { configFile?: string | false }

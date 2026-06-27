@@ -107,7 +107,10 @@ export function deepClone<T>(value: T): DeepWritable<T> {
     return new RegExp(value) as DeepWritable<T>
   }
   if (typeof value === 'object' && value != null) {
-    throw new Error('Cannot deep clone non-plain object')
+    // Non-plain objects (class instances, Map, Set, Date, etc.) are shared by
+    // reference, consistent with how Function is handled above. Plugin instances
+    // are designed to be shared and must not be reconstructed.
+    return value as DeepWritable<T>
   }
   return value as DeepWritable<T>
 }

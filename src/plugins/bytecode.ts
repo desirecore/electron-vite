@@ -1,6 +1,8 @@
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { spawn } from 'node:child_process'
-import { createRequire } from 'node:module'
+import { fileURLToPath } from 'node:url'
 import colors from 'picocolors'
 import { type Plugin, type LibraryOptions, type Rolldown, normalizePath } from 'vite'
 import * as babel from '@babel/core'
@@ -10,56 +12,118 @@ import { toRelativePath } from '../utils'
 
 // Inspired by https://github.com/bytenode/bytenode
 
-const _require = createRequire(import.meta.url)
-
 function getBytecodeCompilerPath(): string {
-  return path.join(path.dirname(_require.resolve('electron-vite/package.json')), 'bin', 'electron-bytecode.cjs')
+  // Resolve the compiler script relative to this module (walking up to the package
+  // root) rather than by package name, so the path stays correct for forks/renames.
+  let dir = path.dirname(fileURLToPath(import.meta.url))
+  for (;;) {
+    const candidate = path.join(dir, 'bin', 'electron-bytecode.cjs')
+    if (fs.existsSync(candidate)) return candidate
+    const parent = path.dirname(dir)
+    if (parent === dir) {
+      throw new Error('Could not locate bin/electron-bytecode.cjs for the bytecode plugin')
+    }
+    dir = parent
+  }
 }
 
-function compileToBytecode(code: string): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    let data = Buffer.from([])
+let bytecodeId = 0
 
+function compileToBytecode(code: string, renderer: boolean): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
     const electronPath = getElectronPath()
     const bytecodePath = getBytecodeCompilerPath()
 
+    // The compiler launches a headless Electron app, which needs a display on Linux.
+    if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+      reject(
+        new Error(
+          'Compiling bytecode launches a headless Electron process, which requires a display on Linux. ' +
+            'Run the build under a virtual framebuffer, e.g. `xvfb-run --auto-servernum electron-vite build`, ' +
+            'or set the DISPLAY environment variable.'
+        )
+      )
+      return
+    }
+
+    // Compile in a real Electron process whose V8 isolate matches the one that will load
+    // the cache. On V8 14.8+ (Electron 42+) the code cache is bound to a snapshot/isolate
+    // checksum (header @16) AND a flag hash that both differ per process type, so a cache
+    // produced in the wrong process type is rejected (and patching the header corrupts
+    // execution). ELECTRON_RUN_AS_NODE is never used, as its isolate matches neither the
+    // main nor the renderer process:
+    //   - main / node chunks -> the Electron browser (main) process
+    //   - preload chunks     -> a renderer process (a hidden window whose sandbox:false
+    //                           preload performs the compile)
+    // A GUI process has no usable stdio pipe, so code in / cache out go through temp files.
+    // The id is monotonic within the process and namespaced by pid, keeping concurrent
+    // compilations (and parallel electron-vite builds) from colliding.
+    const id = `${process.pid}-${bytecodeId++}`
+    const inFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.in.js`)
+    const outFile = path.join(os.tmpdir(), `electron-vite-bytecode-${id}.out.jsc`)
+
+    const cleanup = (): void => {
+      fs.rmSync(inFile, { force: true })
+      fs.rmSync(outFile, { force: true })
+    }
+
+    const env: NodeJS.ProcessEnv = {
+      ...process.env,
+      ELECTRON_VITE_BYTECODE_IN: inFile,
+      ELECTRON_VITE_BYTECODE_OUT: outFile
+    }
+    delete env.ELECTRON_RUN_AS_NODE
+    if (renderer) {
+      env.ELECTRON_VITE_BYTECODE_RENDERER = '1'
+    }
+
+    try {
+      fs.writeFileSync(inFile, code)
+    } catch (err) {
+      cleanup()
+      reject(err as Error)
+      return
+    }
+
     const proc = spawn(electronPath, [bytecodePath], {
-      env: { ELECTRON_RUN_AS_NODE: '1' },
-      stdio: ['pipe', 'pipe', 'pipe', 'ipc']
+      env,
+      stdio: ['ignore', 'ignore', 'pipe']
     })
 
-    if (proc.stdin) {
-      proc.stdin.write(code)
-      proc.stdin.end()
-    }
-
-    if (proc.stdout) {
-      proc.stdout.on('data', chunk => {
-        data = Buffer.concat([data, chunk])
-      })
-      proc.stdout.on('error', err => {
-        console.error(err)
-      })
-      proc.stdout.on('end', () => {
-        resolve(data)
-      })
-    }
-
+    let stderr = ''
     if (proc.stderr) {
       proc.stderr.on('data', chunk => {
-        console.error('Error: ', chunk.toString())
-      })
-      proc.stderr.on('error', err => {
-        console.error('Error: ', err)
+        stderr += chunk.toString()
       })
     }
 
-    proc.addListener('message', message => console.log(message))
-    proc.addListener('error', err => console.error(err))
+    proc.on('error', err => {
+      cleanup()
+      reject(err)
+    })
 
-    proc.on('error', err => reject(err))
-    proc.on('exit', () => {
-      resolve(data)
+    // Read the cache only after the process exits. Unlike the previous stdout/exit race
+    // (which could resolve with a truncated or empty buffer), this makes the output
+    // deterministic and surfaces a real error instead of silently emitting a bad chunk.
+    proc.on('exit', exitCode => {
+      let data: Buffer | undefined
+      try {
+        data = fs.readFileSync(outFile)
+      } catch {
+        data = undefined
+      }
+      cleanup()
+      if (data && data.length > 0) {
+        resolve(data)
+      } else {
+        reject(
+          new Error(
+            `Failed to compile chunk to bytecode (exit code ${exitCode ?? 'null'}).${
+              stderr ? `\n${stderr.trim()}` : ''
+            }`
+          )
+        )
+      }
     })
   })
 }
@@ -73,47 +137,38 @@ const bytecodeModuleLoaderCode = [
   `const Module = require("module");`,
   `v8.setFlagsFromString("--no-lazy");`,
   `v8.setFlagsFromString("--no-flush-bytecode");`,
-  `const FLAG_HASH_OFFSET = 12;`,
+  `const COMPILE_PARAMS = ["exports", "require", "module", "__filename", "__dirname"];`,
   `const SOURCE_HASH_OFFSET = 8;`,
-  `let dummyBytecode;`,
-  `function setFlagHashHeader(bytecodeBuffer) {`,
-  `  if (!dummyBytecode) {`,
-  `    const script = new vm.Script("", {`,
-  `      produceCachedData: true`,
-  `    });`,
-  `    dummyBytecode = script.createCachedData();`,
+  `function sourceLength(bytecodeBuffer) {`,
+  `  // The low 28 bits of the source hash hold the source length; the high bits are V8`,
+  `  // source-hash flags (e.g. the "wrapped" bit set by vm.compileFunction).`,
+  `  return bytecodeBuffer.readUInt32LE(SOURCE_HASH_OFFSET) & 0x0fffffff;`,
+  `};`,
+  `function placeholderBody(len, filename) {`,
+  `  // A same-length body so the cache's source hash matches. Its content is ignored at`,
+  `  // execution (V8 runs the cached bytecode) but must be UNIQUE per file, otherwise V8's`,
+  `  // in-isolate compilation cache returns an earlier module's compiled function and`,
+  `  // drops this file's cached data, executing the wrong (placeholder) source.`,
+  `  const tag = "/*" + filename + " ";`,
+  `  if (tag.length + 2 <= len) {`,
+  `    return tag + " ".repeat(len - tag.length - 2) + "*/";`,
   `  }`,
-  `  dummyBytecode.slice(FLAG_HASH_OFFSET, FLAG_HASH_OFFSET + 4).copy(bytecodeBuffer, FLAG_HASH_OFFSET);`,
-  `};`,
-  `function getSourceHashHeader(bytecodeBuffer) {`,
-  `  return bytecodeBuffer.slice(SOURCE_HASH_OFFSET, SOURCE_HASH_OFFSET + 4);`,
-  `};`,
-  `function buffer2Number(buffer) {`,
-  `  let ret = 0;`,
-  `  ret |= buffer[3] << 24;`,
-  `  ret |= buffer[2] << 16;`,
-  `  ret |= buffer[1] << 8;`,
-  `  ret |= buffer[0];`,
-  `  return ret;`,
+  `  if (len >= 4) {`,
+  `    return "/*" + (filename + " ").slice(0, len - 4).padEnd(len - 4, " ") + "*/";`,
+  `  }`,
+  `  return " ".repeat(len);`,
   `};`,
   `Module._extensions[".jsc"] = Module._extensions[".cjsc"] = function (module, filename) {`,
   `  const bytecodeBuffer = fs.readFileSync(filename);`,
   `  if (!Buffer.isBuffer(bytecodeBuffer)) {`,
   `    throw new Error("BytecodeBuffer must be a buffer object.");`,
   `  }`,
-  `  setFlagHashHeader(bytecodeBuffer);`,
-  `  const length = buffer2Number(getSourceHashHeader(bytecodeBuffer));`,
-  `  let dummyCode = "";`,
-  `  if (length > 1) {`,
-  `    dummyCode = "\\"" + "\\u200b".repeat(length - 2) + "\\"";`,
-  `  }`,
-  `  const script = new vm.Script(dummyCode, {`,
+  `  const placeholder = placeholderBody(sourceLength(bytecodeBuffer), filename);`,
+  `  const compiledWrapper = vm.compileFunction(placeholder, COMPILE_PARAMS, {`,
   `    filename: filename,`,
-  `    lineOffset: 0,`,
-  `    displayErrors: true,`,
   `    cachedData: bytecodeBuffer`,
   `  });`,
-  `  if (script.cachedDataRejected) {`,
+  `  if (compiledWrapper.cachedDataRejected) {`,
   `    throw new Error("Invalid or incompatible cached data (cachedDataRejected)");`,
   `  }`,
   `  const require = function (id) {`,
@@ -127,22 +182,15 @@ const bytecodeModuleLoaderCode = [
   `  }`,
   `  require.extensions = Module._extensions;`,
   `  require.cache = Module._cache;`,
-  `  const compiledWrapper = script.runInThisContext({`,
-  `    filename: filename,`,
-  `    lineOffset: 0,`,
-  `    columnOffset: 0,`,
-  `    displayErrors: true`,
-  `  });`,
   `  const dirname = path.dirname(filename);`,
-  `  const args = [module.exports, require, module, filename, dirname, process, global];`,
-  `  return compiledWrapper.apply(module.exports, args);`,
+  `  return compiledWrapper.call(module.exports, module.exports, require, module, filename, dirname);`,
   `};`
 ]
 
 const bytecodeChunkExtensionRE = /.(jsc|cjsc)$/
 
 export interface BytecodeOptions {
-  chunkAlias?: string | string[]
+  chunkAlias?: string | RegExp | (string | RegExp)[]
   transformArrowFunctions?: boolean
   removeBundleJS?: boolean
   protectedStrings?: string[]
@@ -163,7 +211,10 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
 
   const transformAllChunks = _chunkAlias.length === 0
   const isBytecodeChunk = (chunkName: string): boolean => {
-    return transformAllChunks || _chunkAlias.some(alias => alias === chunkName)
+    return (
+      transformAllChunks ||
+      _chunkAlias.some(alias => (alias instanceof RegExp ? alias.test(chunkName) : alias === chunkName))
+    )
   }
 
   const plugins: babel.PluginItem[] = []
@@ -190,6 +241,9 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
   const bytecodeModuleLoader = 'bytecode-loader.cjs'
 
   let supported = false
+  // Preload runs in a renderer-type V8 isolate (a different snapshot/flag hash than the
+  // browser/main process), so its chunks must be compiled in a renderer process.
+  let isPreload = false
 
   return {
     name: 'vite:bytecode',
@@ -199,7 +253,8 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
       if (supported) {
         return
       }
-      const useInRenderer = config.plugins.some(p => p.name === 'vite:electron-renderer-preset-config')
+      isPreload = config.plugins.some(p => p.name === 'vite:electron-preload-config-preset')
+      const useInRenderer = config.plugins.some(p => p.name === 'vite:electron-renderer-config-preset')
       if (useInRenderer) {
         config.logger.warn(colors.yellow('bytecodePlugin does not support renderer.'))
         return
@@ -274,7 +329,7 @@ export function bytecodePlugin(options: BytecodeOptions = {}): Plugin | null {
               }
             }
             if (bytecodeChunks.includes(name)) {
-              const bytecodeBuffer = await compileToBytecode(_code)
+              const bytecodeBuffer = await compileToBytecode(_code, isPreload)
               this.emitFile({
                 type: 'asset',
                 fileName: name + 'c',
@@ -407,6 +462,40 @@ function protectStringsPlugin(api: typeof babel & babel.ConfigAPI): babel.Plugin
         const { value } = path.node
         if (state.opts.protectedStrings.has(value)) {
           path.replaceWith(createFromCharCodeFunction(value))
+        }
+      },
+      BinaryExpression(path, state) {
+        // Fold constant string concatenations (e.g. `"a" + "b"`, or a certificate split
+        // across lines as `"-----BEGIN..." + "\n" + "..."`) so a protected value assembled
+        // from several literals is still replaced, not just single-literal occurrences.
+        if (path.node.operator !== '+') {
+          return
+        }
+
+        // obj['a' + 'b']
+        if (path.parentPath.isMemberExpression({ property: path.node, computed: true })) {
+          return
+        }
+
+        // { ['a' + 'b']: value }
+        if (path.parentPath.isObjectProperty({ key: path.node, computed: true })) {
+          return
+        }
+
+        // require('a' + 'b')
+        if (
+          path.parentPath.isCallExpression() &&
+          t.isIdentifier(path.parentPath.node.callee) &&
+          path.parentPath.node.callee.name === 'require' &&
+          path.parentPath.node.arguments[0] === path.node
+        ) {
+          return
+        }
+
+        const { confident, value } = path.evaluate()
+        if (confident && typeof value === 'string' && state.opts.protectedStrings.has(value)) {
+          path.replaceWith(createFromCharCodeFunction(value))
+          path.skip()
         }
       },
       TemplateLiteral(path, state) {

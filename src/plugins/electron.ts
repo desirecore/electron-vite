@@ -30,6 +30,39 @@ function findInput(root: string, scope = 'renderer'): string {
   return ''
 }
 
+function resolveHtmlEntries(input: Rolldown.InputOption | undefined, root: string): string[] {
+  const entries: string[] = []
+  const collect = (entry: string): void => {
+    if (entry.endsWith('.html')) {
+      entries.push(normalizePath(path.resolve(root, entry)))
+    }
+  }
+  if (typeof input === 'string') {
+    collect(input)
+  } else if (Array.isArray(input)) {
+    input.forEach(collect)
+  } else if (input) {
+    Object.values(input).forEach(collect)
+  }
+  return entries
+}
+
+function getCommonDir(dirs: string[]): string {
+  const segments = dirs.map(dir => dir.split('/'))
+  const base = segments[0]
+  let length = base.length
+  for (const parts of segments) {
+    length = Math.min(length, parts.length)
+    for (let i = 0; i < length; i++) {
+      if (parts[i] !== base[i]) {
+        length = i
+        break
+      }
+    }
+  }
+  return base.slice(0, length).join('/') || '/'
+}
+
 function processEnvDefine(): Record<string, string> {
   return {
     'process.env': `process.env`,
@@ -373,6 +406,22 @@ export function electronRendererConfigPresetPlugin(options?: ElectronPluginOptio
 
       const buildConfig = mergeConfig(defaultConfig.build, config.build || {})
       config.build = buildConfig
+
+      // When the renderer html entry lives outside the resolved root, Vite's
+      // `vite:build-html` plugin emits a fileName computed via `path.relative(root, html)`
+      // that contains `../` segments, which Rolldown rejects. Re-root to the common
+      // ancestor of the html entries so the emitted fileName stays relative.
+      const htmlEntries = resolveHtmlEntries(config.build.rolldownOptions?.input, root)
+      if (htmlEntries.length > 0) {
+        const rendererRoot = normalizePath(path.resolve(root, config.root))
+        const hasOutsideEntry = htmlEntries.some(entry => {
+          const relative = path.relative(rendererRoot, entry)
+          return relative.startsWith('..') || path.isAbsolute(relative)
+        })
+        if (hasOutsideEntry) {
+          config.root = getCommonDir(htmlEntries.map(entry => path.posix.dirname(entry)))
+        }
+      }
 
       config.envDir = config.envDir || path.resolve(root)
 

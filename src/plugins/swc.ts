@@ -84,7 +84,8 @@ export function swcPlugin(options: SwcOptions = {}): Plugin {
     name: 'vite:swc',
     config(): UserConfig {
       return {
-        esbuild: false
+        esbuild: false,
+        oxc: false
       }
     },
     async configResolved(resolvedConfig): Promise<void> {

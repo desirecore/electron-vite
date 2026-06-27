@@ -1,6 +1,6 @@
 {
-  "name": "electron-vite",
-  "version": "6.0.0-beta.1",
+  "name": "@desirecore/electron-vite",
+  "version": "6.0.0-beta.3",
   "description": "Electron build tooling based on Vite",
   "type": "module",
   "main": "./dist/index.js",
@@ -28,12 +28,15 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/alex8088/electron-vite.git"
+    "url": "git+https://github.com/desirecore/electron-vite.git"
   },
   "bugs": {
-    "url": "https://github.com/alex8088/electron-vite/issues"
+    "url": "https://github.com/desirecore/electron-vite/issues"
   },
-  "homepage": "https://electron-vite.org",
+  "homepage": "https://github.com/desirecore/electron-vite",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "electron",
     "vite",
